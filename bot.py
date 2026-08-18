@@ -54,6 +54,33 @@ TRAILING_STOP_ENABLED = os.getenv("TRAILING_STOP_ENABLED", "true").lower() == "t
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "1.5"))  # start trailing once gain exceeds this %
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "1.0"))     # trail this % behind the peak once active
 
+# --- v4 additions: volatility-adaptive thresholds + partial profit taking ---
+ATR_ENABLED = os.getenv("ATR_ENABLED", "true").lower() == "true"
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+# Thresholds become ATR% * multiplier instead of a fixed %, so a volatile coin (e.g. DOGE)
+# gets wider bands than a calmer one (e.g. BTC) automatically, instead of one-size-fits-all.
+ATR_DIP_MULTIPLIER = float(os.getenv("ATR_DIP_MULTIPLIER", "1.0"))
+ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", "1.5"))
+ATR_STOP_MULTIPLIER = float(os.getenv("ATR_STOP_MULTIPLIER", "1.8"))
+# Floors so ATR-derived thresholds never get unreasonably tiny on a quiet coin
+MIN_DIP_PCT = float(os.getenv("MIN_DIP_PCT", "0.8"))
+MIN_TARGET_PCT = float(os.getenv("MIN_TARGET_PCT", "1.0"))
+MIN_STOP_PCT = float(os.getenv("MIN_STOP_PCT", "1.5"))
+
+PARTIAL_TAKE_PROFIT_ENABLED = os.getenv("PARTIAL_TAKE_PROFIT_ENABLED", "true").lower() == "true"
+PARTIAL_TAKE_PROFIT_FRACTION = float(os.getenv("PARTIAL_TAKE_PROFIT_FRACTION", "0.5"))  # sell this fraction at target
+
+# --- v5: adaptive per-symbol tuning ---
+# Not machine learning — a transparent feedback loop. Each symbol gets its own
+# "confidence" score based on its recent win/loss record. A symbol trading well
+# gets slightly easier entry conditions (more willing to trade it); a symbol
+# trading poorly gets stricter conditions (harder to trigger) until it proves itself again.
+ADAPTIVE_ENABLED = os.getenv("ADAPTIVE_ENABLED", "true").lower() == "true"
+ADAPTIVE_LOOKBACK_TRADES = int(os.getenv("ADAPTIVE_LOOKBACK_TRADES", "5"))   # how many recent closed trades per symbol to judge
+ADAPTIVE_STEP = float(os.getenv("ADAPTIVE_STEP", "0.1"))                     # how much confidence shifts per win/loss
+ADAPTIVE_MIN_MULTIPLIER = float(os.getenv("ADAPTIVE_MIN_MULTIPLIER", "0.7")) # floor: never require less than 70% of normal dip
+ADAPTIVE_MAX_MULTIPLIER = float(os.getenv("ADAPTIVE_MAX_MULTIPLIER", "1.5")) # ceiling: never demand more than 150% of normal dip
+
 STATE_FILE = "state.json"
 PORT = int(os.getenv("PORT", "10000"))  # Render sets $PORT automatically
 DASHBOARD_LOG_BUFFER = int(os.getenv("DASHBOARD_LOG_BUFFER", "200"))  # how many recent log lines the dashboard keeps
@@ -82,7 +109,7 @@ log.addHandler(_buffer_handler)
 # ---------------- DASHBOARD SERVER (health check + profit/logs UI, for Render + UptimeRobot) ----------------
 # The main loop keeps this updated so the HTTP handlers (running in their own thread)
 # always see current data without needing to touch the exchange themselves.
-_shared_state = {"positions": {}, "trade_log": []}
+_shared_state = {"positions": {}, "trade_log": [], "symbol_stats": {}}
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -156,24 +183,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>Adaptive Per-Symbol Tuning</h2>
+    <table id="adaptive-table">
+      <thead><tr><th>Symbol</th><th>Recent Win Rate</th><th>Multiplier</th><th>Meaning</th></tr></thead>
+      <tbody id="adaptive-body"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
     <h2>Live Logs</h2>
     <div id="logs"><div class="empty">Loading...</div></div>
   </section>
 </main>
-<footer>Auto-refreshes every 10s &middot; Dip-Buy Bot v3</footer>
+<footer>Auto-refreshes every 10s &middot; Dip-Buy Bot v5</footer>
 
 <script>
 function fmt(n, d=4) { return (typeof n === 'number') ? n.toFixed(d) : n; }
 
 async function refresh() {
   try {
-    const [statusRes, posRes, tradesRes, logsRes] = await Promise.all([
-      fetch('/api/status'), fetch('/api/positions'), fetch('/api/trades'), fetch('/api/logs')
+    const [statusRes, posRes, tradesRes, logsRes, adaptiveRes] = await Promise.all([
+      fetch('/api/status'), fetch('/api/positions'), fetch('/api/trades'), fetch('/api/logs'), fetch('/api/adaptive')
     ]);
     const status = await statusRes.json();
     const positions = await posRes.json();
     const trades = await tradesRes.json();
     const logs = await logsRes.json();
+    const adaptive = await adaptiveRes.json();
 
     const badge = document.getElementById('mode-badge');
     badge.textContent = status.testnet ? 'TESTNET' : 'LIVE';
@@ -233,6 +269,27 @@ async function refresh() {
       logsEl.innerHTML = logs.slice().reverse().map(l =>
         `<div class="log-line log-${l.level}">[${new Date(l.time).toLocaleTimeString()}] ${l.message}</div>`
       ).join('');
+    }
+
+    const adaptiveBody = document.getElementById('adaptive-body');
+    adaptiveBody.innerHTML = '';
+    const adaptiveEntries = Object.entries(adaptive);
+    if (adaptiveEntries.length === 0) {
+      adaptiveBody.innerHTML = '<tr><td colspan="4" class="empty">No trades closed yet — every symbol starts neutral at 1.0x</td></tr>';
+    } else {
+      for (const [symbol, s] of adaptiveEntries) {
+        const results = s.recent_results || [];
+        const wins = results.reduce((a,b) => a+b, 0);
+        const winRate = results.length ? (wins / results.length * 100).toFixed(0) + '%' : '—';
+        const mult = s.multiplier || 1.0;
+        const meaning = mult > 1.02 ? 'stricter (recent losses)' : (mult < 0.98 ? 'more willing (recent wins)' : 'neutral');
+        adaptiveBody.innerHTML += `<tr>
+          <td>${symbol}</td>
+          <td>${winRate} (${results.length} trades)</td>
+          <td>${mult.toFixed(2)}x</td>
+          <td>${meaning}</td>
+        </tr>`;
+      }
     }
   } catch (e) {
     console.error('Dashboard refresh failed', e);
@@ -295,6 +352,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(list(_log_buffer))
             return
 
+        if path == "/api/adaptive":
+            self._json(_shared_state.get("symbol_stats", {}))
+            return
+
         self._json({"error": "not found"}, code=404)
 
     def log_message(self, format, *args):
@@ -308,8 +369,10 @@ def start_dashboard_server():
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"positions": {}, "price_history": {}, "trade_log": []}
+            state = json.load(f)
+            state.setdefault("symbol_stats", {})
+            return state
+    return {"positions": {}, "price_history": {}, "trade_log": [], "symbol_stats": {}}
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
@@ -357,6 +420,55 @@ def calc_sma(values, period):
         return None
     return sum(values[-period:]) / period
 
+def calc_atr_pct(raw_klines, period=14):
+    """
+    Average True Range as a % of price — measures how much a coin actually moves,
+    so thresholds can scale per-coin instead of using one fixed % for everything.
+    Returns None if there isn't enough data yet.
+    """
+    if len(raw_klines) < period + 1:
+        return None
+    highs = [float(k[2]) for k in raw_klines]
+    lows = [float(k[3]) for k in raw_klines]
+    closes = [float(k[4]) for k in raw_klines]
+
+    true_ranges = []
+    for i in range(1, len(raw_klines)):
+        high, low, prev_close = highs[i], lows[i], closes[i - 1]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+
+    atr = sum(true_ranges[-period:]) / period
+    last_price = closes[-1]
+    if last_price == 0:
+        return None
+    return (atr / last_price) * 100
+
+def get_dynamic_thresholds(client, state, symbol):
+    """
+    Returns (dip_pct, target_pct, stop_pct) for this symbol.
+    If ATR is enabled and there's enough data, thresholds scale with the coin's
+    recent volatility (floored at MIN_*_PCT so a very quiet coin doesn't get
+    unreasonably tight bands). Falls back to the fixed config values otherwise.
+    The dip threshold is then further scaled by this symbol's adaptive
+    multiplier — stricter after recent losses, more willing after recent wins.
+    """
+    if not ATR_ENABLED:
+        dip, target, stop = DIP_THRESHOLD_PCT, SELL_TARGET_PCT, STOP_LOSS_PCT
+    else:
+        raw = get_klines(client, symbol, KLINE_INTERVAL, ATR_PERIOD + 5)
+        atr_pct = calc_atr_pct(raw, ATR_PERIOD)
+        if atr_pct is None:
+            dip, target, stop = DIP_THRESHOLD_PCT, SELL_TARGET_PCT, STOP_LOSS_PCT
+        else:
+            dip = max(atr_pct * ATR_DIP_MULTIPLIER, MIN_DIP_PCT)
+            target = max(atr_pct * ATR_TARGET_MULTIPLIER, MIN_TARGET_PCT)
+            stop = max(atr_pct * ATR_STOP_MULTIPLIER, MIN_STOP_PCT)
+
+    multiplier = get_symbol_multiplier(state, symbol)
+    dip = dip * multiplier  # >1.0 = needs a bigger dip to trigger (stricter), <1.0 = triggers more easily
+    return dip, target, stop
+
 def is_uptrend_or_neutral(client, symbol):
     if not TREND_FILTER_ENABLED:
         return True
@@ -403,7 +515,50 @@ def get_min_notional(client, symbol):
             return float(f.get("minNotional", 5))
     return 5.0
 
-def place_buy(client, state, symbol, price, reason):
+def get_symbol_multiplier(state, symbol):
+    """
+    Returns this symbol's current adaptive multiplier (1.0 = normal).
+    Above 1.0 means recent trades on this symbol have been losing more than
+    winning, so entry requirements get stricter (harder dip threshold to clear).
+    Below 1.0 means recent trades have been winning, so it's traded slightly
+    more readily. Always clamped between ADAPTIVE_MIN/MAX_MULTIPLIER.
+    """
+    if not ADAPTIVE_ENABLED:
+        return 1.0
+    stats = state.get("symbol_stats", {}).get(symbol)
+    if not stats:
+        return 1.0
+    return stats.get("multiplier", 1.0)
+
+def update_symbol_confidence(state, symbol, was_win):
+    """
+    Called after a position fully closes. Nudges the symbol's multiplier based
+    on whether the trade was a net win or loss, using only the last
+    ADAPTIVE_LOOKBACK_TRADES results so it adapts to recent behavior, not
+    ancient history from days ago.
+    """
+    if not ADAPTIVE_ENABLED:
+        return
+    stats = state.setdefault("symbol_stats", {}).setdefault(symbol, {"multiplier": 1.0, "recent_results": []})
+    stats["recent_results"].append(1 if was_win else 0)
+    stats["recent_results"] = stats["recent_results"][-ADAPTIVE_LOOKBACK_TRADES:]
+
+    wins = sum(stats["recent_results"])
+    total = len(stats["recent_results"])
+    win_rate = wins / total if total else 0.5
+
+    # win_rate > 0.5 -> multiplier drifts below 1.0 (easier entry, trading it well)
+    # win_rate < 0.5 -> multiplier drifts above 1.0 (stricter entry, trading it poorly)
+    drift = (0.5 - win_rate) * 2 * ADAPTIVE_STEP  # scaled by how far from 50/50
+    new_multiplier = stats["multiplier"] + drift
+    stats["multiplier"] = max(ADAPTIVE_MIN_MULTIPLIER, min(ADAPTIVE_MAX_MULTIPLIER, new_multiplier))
+
+    log.info(
+        f"{symbol}: adaptive update — last {total} trades win rate {win_rate*100:.0f}%, "
+        f"multiplier now {stats['multiplier']:.2f}x (>1.0 = stricter, <1.0 = more willing)"
+    )
+
+def place_buy(client, state, symbol, price, reason, target_pct, stop_pct):
     qty_usdt = POSITION_SIZE_USDT
     min_notional = get_min_notional(client, symbol)
     if qty_usdt < min_notional:
@@ -418,8 +573,14 @@ def place_buy(client, state, symbol, price, reason):
             "timestamp": datetime.utcnow().isoformat(),
             "peak_price": price,
             "trailing_active": False,
+            "target_pct": target_pct,
+            "stop_pct": stop_pct,
+            "partial_taken": False,
         }
-        log.info(f"BUY {symbol} @ {price} (${qty_usdt}) | reason: {reason} | open positions now: {len(state['positions'])}")
+        log.info(
+            f"BUY {symbol} @ {price} (${qty_usdt}) | reason: {reason} | "
+            f"target {target_pct:.2f}% / stop {stop_pct:.2f}% | open positions now: {len(state['positions'])}"
+        )
         state["trade_log"].append({"action": "BUY", "symbol": symbol, "price": price, "reason": reason, "time": datetime.utcnow().isoformat()})
     except BinanceAPIException as e:
         log.error(f"Buy failed for {symbol}: {e}")
@@ -434,13 +595,38 @@ def place_sell(client, state, symbol, price, reason):
         log.info(f"SELL {symbol} @ {price} | profit: ${profit:.4f} | reason: {reason}")
         state["trade_log"].append({"action": "SELL", "symbol": symbol, "price": price, "profit": profit, "reason": reason, "time": datetime.utcnow().isoformat()})
         del state["positions"][symbol]
+        update_symbol_confidence(state, symbol, was_win=(profit >= 0))
     except BinanceAPIException as e:
         log.error(f"Sell failed for {symbol}: {e}")
+
+def place_partial_sell(client, state, symbol, price, fraction, reason):
+    """Sells a fraction of the position (e.g. half) at target, leaving the rest to trail."""
+    pos = state["positions"].get(symbol)
+    if not pos:
+        return
+    sell_qty = round(pos["qty"] * fraction, 6)
+    if sell_qty <= 0:
+        return
+    try:
+        client.order_market_sell(symbol=symbol, quantity=sell_qty)
+        profit = (price - pos["buy_price"]) * sell_qty
+        log.info(f"PARTIAL SELL {symbol} @ {price} | sold {fraction*100:.0f}% | profit: ${profit:.4f} | reason: {reason}")
+        state["trade_log"].append({
+            "action": "SELL", "symbol": symbol, "price": price, "profit": profit,
+            "reason": f"partial ({fraction*100:.0f}%): {reason}", "time": datetime.utcnow().isoformat()
+        })
+        pos["qty"] = round(pos["qty"] - sell_qty, 6)
+        pos["partial_taken"] = True
+    except BinanceAPIException as e:
+        log.error(f"Partial sell failed for {symbol}: {e}")
 
 def manage_open_position(client, state, symbol, price):
     pos = state["positions"][symbol]
     buy_price = pos["buy_price"]
-    stop_price = buy_price * (1 - STOP_LOSS_PCT / 100)
+    # Use the thresholds stored at buy time (ATR-derived if enabled, else fixed config)
+    target_pct = pos.get("target_pct", SELL_TARGET_PCT)
+    stop_pct = pos.get("stop_pct", STOP_LOSS_PCT)
+    stop_price = buy_price * (1 - stop_pct / 100)
     held_since = datetime.fromisoformat(pos["timestamp"])
     held_hours = (datetime.utcnow() - held_since).total_seconds() / 3600
 
@@ -449,6 +635,13 @@ def manage_open_position(client, state, symbol, price):
         pos["peak_price"] = price
 
     gain_pct = (price - buy_price) / buy_price * 100
+
+    # Partial take-profit: once target is hit and we haven't already taken partial profit,
+    # sell a fraction now to lock in real gains, let the remainder ride the trailing stop.
+    if PARTIAL_TAKE_PROFIT_ENABLED and not pos.get("partial_taken") and gain_pct >= target_pct:
+        place_partial_sell(client, state, symbol, price, PARTIAL_TAKE_PROFIT_FRACTION, f"target {target_pct:.2f}% hit")
+        if symbol not in state["positions"]:
+            return  # fully closed by the partial sell rounding to zero qty
 
     # Trailing stop logic: once gain exceeds activation threshold, trail behind the peak
     if TRAILING_STOP_ENABLED:
@@ -461,9 +654,9 @@ def manage_open_position(client, state, symbol, price):
             if price <= trail_stop_price:
                 place_sell(client, state, symbol, price, f"trailing stop (peak {pos['peak_price']:.4f})")
                 return
-    else:
-        # No trailing stop: use the fixed sell target instead
-        sell_target = buy_price * (1 + SELL_TARGET_PCT / 100)
+    elif not PARTIAL_TAKE_PROFIT_ENABLED:
+        # No trailing stop and no partial take-profit: use the plain fixed/ATR sell target
+        sell_target = buy_price * (1 + target_pct / 100)
         if price >= sell_target:
             place_sell(client, state, symbol, price, "target hit")
             return
@@ -479,11 +672,13 @@ def look_for_entry(client, state, symbol, price):
     if len(state["positions"]) >= MAX_CONCURRENT_POSITIONS:
         return  # capacity full, skip scanning for new entries
 
+    dip_pct, target_pct, stop_pct = get_dynamic_thresholds(client, state, symbol)
+
     high = rolling_high(state, symbol)
     if not high:
         return
     drop_pct = (high - price) / high * 100
-    if drop_pct < DIP_THRESHOLD_PCT:
+    if drop_pct < dip_pct:
         return
 
     rsi = get_rsi(client, symbol)
@@ -500,7 +695,11 @@ def look_for_entry(client, state, symbol, price):
         log.info(f"{symbol}: dip detected but volume not confirming (below {VOLUME_MULTIPLIER}x average). Skipping.")
         return
 
-    place_buy(client, state, symbol, price, f"dip {drop_pct:.2f}% + RSI {rsi:.1f} + volume confirmed")
+    place_buy(
+        client, state, symbol, price,
+        f"dip {drop_pct:.2f}% (threshold {dip_pct:.2f}%) + RSI {rsi:.1f} + volume confirmed",
+        target_pct, stop_pct
+    )
 
 def check_symbol(client, state, symbol):
     try:
@@ -535,9 +734,13 @@ def main():
     for sym, pos in state["positions"].items():
         pos.setdefault("peak_price", pos["buy_price"])
         pos.setdefault("trailing_active", False)
+        pos.setdefault("target_pct", SELL_TARGET_PCT)
+        pos.setdefault("stop_pct", STOP_LOSS_PCT)
+        pos.setdefault("partial_taken", False)
 
     _shared_state["positions"] = state["positions"]
     _shared_state["trade_log"] = state["trade_log"]
+    _shared_state["symbol_stats"] = state["symbol_stats"]
 
     # Start dashboard server in background thread so Render sees this as a live web service
     threading.Thread(target=start_dashboard_server, daemon=True).start()
@@ -549,6 +752,15 @@ def main():
         f"({VOLUME_MULTIPLIER}x) | Trailing stop: {TRAILING_STOP_ENABLED} (activate {TRAILING_ACTIVATION_PCT}%, "
         f"trail {TRAILING_STOP_PCT}%) | Max concurrent positions: {MAX_CONCURRENT_POSITIONS} | Position size: ${POSITION_SIZE_USDT}"
     )
+    log.info(
+        f"ATR-adaptive thresholds: {ATR_ENABLED} (dip x{ATR_DIP_MULTIPLIER}, target x{ATR_TARGET_MULTIPLIER}, "
+        f"stop x{ATR_STOP_MULTIPLIER}, floors {MIN_DIP_PCT}/{MIN_TARGET_PCT}/{MIN_STOP_PCT}%) | "
+        f"Partial take-profit: {PARTIAL_TAKE_PROFIT_ENABLED} (sell {PARTIAL_TAKE_PROFIT_FRACTION*100:.0f}% at target)"
+    )
+    log.info(
+        f"Per-symbol adaptive learning: {ADAPTIVE_ENABLED} (lookback {ADAPTIVE_LOOKBACK_TRADES} trades, "
+        f"step {ADAPTIVE_STEP}, range {ADAPTIVE_MIN_MULTIPLIER}x-{ADAPTIVE_MAX_MULTIPLIER}x)"
+    )
 
     loop_count = 0
     while True:
@@ -559,6 +771,7 @@ def main():
         # Keep the dashboard's view of state current for the HTTP handler thread
         _shared_state["positions"] = state["positions"]
         _shared_state["trade_log"] = state["trade_log"]
+        _shared_state["symbol_stats"] = state["symbol_stats"]
 
         loop_count += 1
         _status["last_check"] = datetime.utcnow().isoformat()
