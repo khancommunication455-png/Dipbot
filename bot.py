@@ -39,6 +39,19 @@ POSITION_SIZE_USDT = float(os.getenv("POSITION_SIZE_USDT", "10"))
 ROLLING_WINDOW = int(os.getenv("ROLLING_WINDOW", "20"))
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 
+# --- v6: whole-market scanning instead of a fixed watchlist ---
+# When enabled, WATCHLIST above is ignored. Instead, every REFRESH interval the
+# bot pulls all USDT pairs from Binance, ranks them by 24h quote volume, and
+# scans the top N most active ones — so it's always looking at what's actually
+# trading right now instead of a hand-picked list that might be quiet.
+MARKET_SCAN_ENABLED = os.getenv("MARKET_SCAN_ENABLED", "false").lower() == "true"
+MARKET_SCAN_TOP_N = int(os.getenv("MARKET_SCAN_TOP_N", "30"))
+MARKET_SCAN_REFRESH_LOOPS = int(os.getenv("MARKET_SCAN_REFRESH_LOOPS", "15"))  # rebuild the list every N loops
+MARKET_SCAN_MIN_VOLUME_USDT = float(os.getenv("MARKET_SCAN_MIN_VOLUME_USDT", "5000000"))  # ignore illiquid pairs
+MARKET_SCAN_EXCLUDE = set(
+    s.strip() for s in os.getenv("MARKET_SCAN_EXCLUDE", "USDCUSDT,FDUSDUSDT,TUSDUSDT,BUSDUSDT,DAIUSDT").split(",") if s.strip()
+)  # stablecoin-vs-stablecoin pairs don't "dip" meaningfully, exclude by default
+
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "35"))
 TREND_MA_PERIOD = int(os.getenv("TREND_MA_PERIOD", "50"))
@@ -109,7 +122,7 @@ log.addHandler(_buffer_handler)
 # ---------------- DASHBOARD SERVER (health check + profit/logs UI, for Render + UptimeRobot) ----------------
 # The main loop keeps this updated so the HTTP handlers (running in their own thread)
 # always see current data without needing to touch the exchange themselves.
-_shared_state = {"positions": {}, "trade_log": [], "symbol_stats": {}}
+_shared_state = {"positions": {}, "trade_log": [], "symbol_stats": {}, "watchlist": []}
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -163,6 +176,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card"><div class="label">Closed Trades</div><div class="value" id="closed">--</div></div>
     <div class="card"><div class="label">Open Positions</div><div class="value" id="open">--</div></div>
     <div class="card"><div class="label">Loops Run</div><div class="value" id="loops">--</div></div>
+    <div class="card"><div class="label">Watching</div><div class="value" id="watching" style="font-size:16px;">--</div></div>
     <div class="card"><div class="label">Uptime Since</div><div class="value" id="since" style="font-size:13px;">--</div></div>
   </div>
 
@@ -224,6 +238,8 @@ async function refresh() {
     document.getElementById('open').textContent = status.open_positions + ' / ' + status.max_positions;
     document.getElementById('loops').textContent = status.loops_completed;
     document.getElementById('since').textContent = new Date(status.started_at).toLocaleString();
+    document.getElementById('watching').textContent = status.watchlist_size + (status.market_scan_enabled ? ' (auto)' : ' (fixed)');
+    document.getElementById('watching').title = (status.watchlist || []).join(', ');
 
     const posBody = document.getElementById('positions-body');
     posBody.innerHTML = '';
@@ -337,6 +353,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "closed_trades": len(sells),
                 "win_rate": win_rate,
                 "total_profit": total_profit,
+                "market_scan_enabled": MARKET_SCAN_ENABLED,
+                "watchlist_size": len(_shared_state.get("watchlist", [])),
+                "watchlist": _shared_state.get("watchlist", []),
             })
             return
 
@@ -385,6 +404,42 @@ def get_client():
     client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
     log.info(f"Connected to Binance {'TESTNET' if USE_TESTNET else 'LIVE'}.")
     return client
+
+def get_active_symbols(client):
+    """
+    Pulls all actively-trading USDT pairs, ranks by 24h quote volume, and
+    returns the top MARKET_SCAN_TOP_N — used when MARKET_SCAN_ENABLED is on,
+    so the bot watches whatever's actually moving right now instead of a
+    fixed hand-picked list.
+    """
+    try:
+        tickers = client.get_ticker()  # 24h stats for every symbol, one call
+    except BinanceAPIException as e:
+        log.error(f"Market scan failed to fetch tickers: {e}")
+        return None
+
+    candidates = []
+    for t in tickers:
+        symbol = t.get("symbol", "")
+        if not symbol.endswith("USDT"):
+            continue
+        if symbol in MARKET_SCAN_EXCLUDE:
+            continue
+        try:
+            quote_volume = float(t.get("quoteVolume", 0))
+        except (TypeError, ValueError):
+            continue
+        if quote_volume < MARKET_SCAN_MIN_VOLUME_USDT:
+            continue
+        candidates.append((symbol, quote_volume))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    top = [symbol for symbol, _ in candidates[:MARKET_SCAN_TOP_N]]
+    log.info(
+        f"Market scan: {len(candidates)} liquid USDT pairs found (min ${MARKET_SCAN_MIN_VOLUME_USDT:,.0f} vol), "
+        f"watching top {len(top)}: {', '.join(top[:10])}{'...' if len(top) > 10 else ''}"
+    )
+    return top
 
 def get_klines(client, symbol, interval, limit):
     try:
@@ -761,10 +816,30 @@ def main():
         f"Per-symbol adaptive learning: {ADAPTIVE_ENABLED} (lookback {ADAPTIVE_LOOKBACK_TRADES} trades, "
         f"step {ADAPTIVE_STEP}, range {ADAPTIVE_MIN_MULTIPLIER}x-{ADAPTIVE_MAX_MULTIPLIER}x)"
     )
+    if MARKET_SCAN_ENABLED:
+        log.info(
+            f"Market-wide scan mode: ON — ignoring static WATCHLIST, watching top {MARKET_SCAN_TOP_N} "
+            f"USDT pairs by volume (min ${MARKET_SCAN_MIN_VOLUME_USDT:,.0f}), refreshed every "
+            f"{MARKET_SCAN_REFRESH_LOOPS} loops (~{MARKET_SCAN_REFRESH_LOOPS * CHECK_INTERVAL_SEC / 60:.0f} min)"
+        )
+
+    active_symbols = list(WATCHLIST)
+    if MARKET_SCAN_ENABLED:
+        scanned = get_active_symbols(client)
+        if scanned:
+            active_symbols = scanned
+    _shared_state["watchlist"] = active_symbols
 
     loop_count = 0
     while True:
-        for symbol in WATCHLIST:
+        # Periodically rebuild the active symbol list from real market volume
+        if MARKET_SCAN_ENABLED and loop_count % MARKET_SCAN_REFRESH_LOOPS == 0 and loop_count > 0:
+            scanned = get_active_symbols(client)
+            if scanned:
+                active_symbols = scanned
+                _shared_state["watchlist"] = active_symbols
+
+        for symbol in active_symbols:
             check_symbol(client, state, symbol)
         save_state(state)
 
