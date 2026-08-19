@@ -414,6 +414,22 @@ def get_client():
     log.info(f"Connected to Binance {'TESTNET' if USE_TESTNET else 'LIVE'}.")
     return client
 
+def get_all_prices(client):
+    """
+    Fetches current prices for every symbol in ONE API call instead of one
+    call per symbol. Checking 30 coins used to mean 30 separate requests every
+    loop, which is what pushed testnet's rate limit over the edge. This uses
+    the same weight as a single ticker call regardless of how many symbols
+    exist on the exchange.
+    Returns a dict {symbol: price} or None on failure.
+    """
+    try:
+        tickers = client.get_all_tickers()
+        return {t["symbol"]: float(t["price"]) for t in tickers}
+    except BinanceAPIException as e:
+        log.error(f"Failed to fetch batched prices: {e}")
+        return None
+
 def get_active_symbols(client):
     """
     Pulls all actively-trading USDT pairs, ranks by 24h quote volume, and
@@ -647,6 +663,11 @@ def reconcile_positions_from_exchange(client, state):
     if not balances:
         return
 
+    # One batched price fetch instead of one call per balance — this was the
+    # other major contributor to hitting testnet's rate limit alongside the
+    # main loop's old per-symbol ticker calls.
+    all_prices = get_all_prices(client) or {}
+
     recovered = 0
     for asset, amount in balances.items():
         if asset in ("USDT", "BUSD", "USDC", "FDUSD"):
@@ -669,10 +690,8 @@ def reconcile_positions_from_exchange(client, state):
             continue
 
         # Only reconstruct if the held value is meaningful (avoids reconciling dust)
-        try:
-            ticker = client.get_symbol_ticker(symbol=symbol)
-            current_price = float(ticker["price"])
-        except BinanceAPIException:
+        current_price = all_prices.get(symbol)
+        if current_price is None:
             continue
         if held_qty * current_price < 1.0:
             continue  # not worth tracking, likely leftover dust
@@ -915,14 +934,7 @@ def look_for_entry(client, state, symbol, price):
         target_pct, stop_pct
     )
 
-def check_symbol(client, state, symbol):
-    try:
-        ticker = client.get_symbol_ticker(symbol=symbol)
-        price = float(ticker["price"])
-    except BinanceAPIException as e:
-        log.error(f"Price fetch failed for {symbol}: {e}")
-        return
-
+def check_symbol(client, state, symbol, price):
     update_price_history(state, symbol, price)
 
     if symbol in state["positions"]:
@@ -959,13 +971,13 @@ def main():
     # Manual escape hatch: immediately close every open position if requested
     if FORCE_CLOSE_ALL and state["positions"]:
         log.warning(f"FORCE_CLOSE_ALL is set — closing all {len(state['positions'])} open position(s) now.")
+        force_close_prices = get_all_prices(client)
         for symbol in list(state["positions"].keys()):
-            try:
-                ticker = client.get_symbol_ticker(symbol=symbol)
-                current_price = float(ticker["price"])
-                place_sell(client, state, symbol, current_price, "manual force-close")
-            except BinanceAPIException as e:
-                log.error(f"FORCE_CLOSE_ALL: failed to fetch price for {symbol}, skipping: {e}")
+            current_price = (force_close_prices or {}).get(symbol)
+            if current_price is None:
+                log.error(f"FORCE_CLOSE_ALL: no price available for {symbol}, skipping.")
+                continue
+            place_sell(client, state, symbol, current_price, "manual force-close")
         save_state(state)
         log.warning(
             "FORCE_CLOSE_ALL complete. Remember to set FORCE_CLOSE_ALL=false and redeploy, "
@@ -1023,8 +1035,21 @@ def main():
                 active_symbols = scanned
                 _shared_state["watchlist"] = active_symbols
 
+        # Fetch every symbol's price in ONE call instead of one call per symbol —
+        # this is the main fix for the rate-limit ban (30 calls -> 1 call per loop)
+        all_prices = get_all_prices(client)
+        if all_prices is None:
+            log.warning("Skipping this loop entirely — couldn't fetch prices (likely rate limited or network issue).")
+            time.sleep(CHECK_INTERVAL_SEC)
+            loop_count += 1
+            continue
+
         for symbol in active_symbols:
-            check_symbol(client, state, symbol)
+            price = all_prices.get(symbol)
+            if price is None:
+                log.warning(f"{symbol}: no price returned in batched fetch, skipping this loop.")
+                continue
+            check_symbol(client, state, symbol, price)
         save_state(state)
 
         # Keep the dashboard's view of state current for the HTTP handler thread
