@@ -584,14 +584,15 @@ def get_lot_size_step(client, symbol):
         return _lot_size_cache[symbol]
     try:
         info = client.get_symbol_info(symbol)
-        for f in info["filters"]:
-            if f["filterType"] == "LOT_SIZE":
-                step = float(f["stepSize"])
-                _lot_size_cache[symbol] = step
-                return step
+        if info and info.get("filters"):
+            for f in info["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+                    _lot_size_cache[symbol] = step
+                    return step
     except BinanceAPIException as e:
         log.error(f"Failed to fetch LOT_SIZE for {symbol}: {e}")
-    _lot_size_cache[symbol] = 0.000001  # sane fallback
+    _lot_size_cache[symbol] = 0.000001  # sane fallback (symbol invalid or filters missing)
     return 0.000001
 
 def round_to_step(quantity, step):
@@ -641,9 +642,11 @@ def reconcile_positions_from_exchange(client, state):
 
         # Confirm this is actually a tradeable pair before querying trade history
         try:
-            client.get_symbol_info(symbol)
+            info = client.get_symbol_info(symbol)
+            if not info:
+                continue  # not a valid USDT pair (e.g. dust from a testnet faucet token), skip
         except BinanceAPIException:
-            continue  # not a valid USDT pair (e.g. dust from some other asset), skip
+            continue
 
         step = get_lot_size_step(client, symbol)
         held_qty = round_to_step(amount, step)
