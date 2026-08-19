@@ -94,6 +94,15 @@ ADAPTIVE_STEP = float(os.getenv("ADAPTIVE_STEP", "0.1"))                     # h
 ADAPTIVE_MIN_MULTIPLIER = float(os.getenv("ADAPTIVE_MIN_MULTIPLIER", "0.7")) # floor: never require less than 70% of normal dip
 ADAPTIVE_MAX_MULTIPLIER = float(os.getenv("ADAPTIVE_MAX_MULTIPLIER", "1.5")) # ceiling: never demand more than 150% of normal dip
 
+# --- v7: manual force-close ---
+# One-time escape hatch: set to true, redeploy, and the bot immediately market-sells
+# every open position on startup (before the main loop begins) instead of waiting
+# for target/stop/max-hold. Useful for manually flattening positions that got stuck
+# or that you just want gone, without needing a testnet trading UI (which doesn't
+# really exist for manual clicking — testnet is API-only). Set back to false after
+# the redeploy that does the closing, or it'll try to close everything on every restart.
+FORCE_CLOSE_ALL = os.getenv("FORCE_CLOSE_ALL", "false").lower() == "true"
+
 STATE_FILE = "state.json"
 PORT = int(os.getenv("PORT", "10000"))  # Render sets $PORT automatically
 DASHBOARD_LOG_BUFFER = int(os.getenv("DASHBOARD_LOG_BUFFER", "200"))  # how many recent log lines the dashboard keeps
@@ -939,6 +948,22 @@ def main():
     # state.json lost track of (e.g. after a free-tier redeploy wiped it)
     reconcile_positions_from_exchange(client, state)
     save_state(state)
+
+    # Manual escape hatch: immediately close every open position if requested
+    if FORCE_CLOSE_ALL and state["positions"]:
+        log.warning(f"FORCE_CLOSE_ALL is set — closing all {len(state['positions'])} open position(s) now.")
+        for symbol in list(state["positions"].keys()):
+            try:
+                ticker = client.get_symbol_ticker(symbol=symbol)
+                current_price = float(ticker["price"])
+                place_sell(client, state, symbol, current_price, "manual force-close")
+            except BinanceAPIException as e:
+                log.error(f"FORCE_CLOSE_ALL: failed to fetch price for {symbol}, skipping: {e}")
+        save_state(state)
+        log.warning(
+            "FORCE_CLOSE_ALL complete. Remember to set FORCE_CLOSE_ALL=false and redeploy, "
+            "or it will try to close everything again on every future restart."
+        )
 
     # Backfill new position fields for any positions saved by an older bot version
     for sym, pos in state["positions"].items():
