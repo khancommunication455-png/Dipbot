@@ -570,6 +570,140 @@ def get_min_notional(client, symbol):
             return float(f.get("minNotional", 5))
     return 5.0
 
+_lot_size_cache = {}
+
+def get_lot_size_step(client, symbol):
+    """
+    Binance requires order quantities to be a multiple of each symbol's step size
+    (e.g. some coins only allow whole numbers, others allow 2 or 6 decimals).
+    A generic round(qty, 6) can produce a quantity Binance rejects with a
+    LOT_SIZE filter error — this fetches the real step size so sells actually go through.
+    Cached per symbol since this doesn't change often and avoids extra API calls every trade.
+    """
+    if symbol in _lot_size_cache:
+        return _lot_size_cache[symbol]
+    try:
+        info = client.get_symbol_info(symbol)
+        for f in info["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step = float(f["stepSize"])
+                _lot_size_cache[symbol] = step
+                return step
+    except BinanceAPIException as e:
+        log.error(f"Failed to fetch LOT_SIZE for {symbol}: {e}")
+    _lot_size_cache[symbol] = 0.000001  # sane fallback
+    return 0.000001
+
+def round_to_step(quantity, step):
+    """Rounds a quantity DOWN to the nearest valid multiple of the exchange's step size."""
+    if step <= 0:
+        return quantity
+    # floor division to the step, then correct for float imprecision
+    steps = int(quantity / step)
+    result = steps * step
+    # avoid tiny float artifacts like 0.30000000000000004
+    decimals = max(0, len(str(step).split(".")[-1])) if "." in str(step) else 0
+    return round(result, decimals)
+
+def reconcile_positions_from_exchange(client, state):
+    """
+    Self-healing startup check: asks Binance what the account is actually holding
+    (real balances) instead of only trusting state.json, which can be wiped on a
+    free-tier redeploy. For any coin held in the watchlist/scan universe that the
+    bot doesn't already have a tracked position for, this looks up the account's
+    recent trade history for that symbol to find the actual buy price and
+    timestamp, then reconstructs the position so the bot can manage it again.
+
+    This only ADDS positions the bot lost track of — it never removes or
+    overwrites a position state.json already knows about.
+    """
+    try:
+        account = client.get_account()
+    except BinanceAPIException as e:
+        log.error(f"Reconciliation: failed to fetch account balances: {e}")
+        return
+
+    balances = {
+        b["asset"]: float(b["free"]) + float(b["locked"])
+        for b in account.get("balances", [])
+        if float(b["free"]) + float(b["locked"]) > 0
+    }
+    if not balances:
+        return
+
+    recovered = 0
+    for asset, amount in balances.items():
+        if asset in ("USDT", "BUSD", "USDC", "FDUSD"):
+            continue  # quote currencies, not positions
+        symbol = f"{asset}USDT"
+        if symbol in state["positions"]:
+            continue  # already tracked, nothing to reconcile
+
+        # Confirm this is actually a tradeable pair before querying trade history
+        try:
+            client.get_symbol_info(symbol)
+        except BinanceAPIException:
+            continue  # not a valid USDT pair (e.g. dust from some other asset), skip
+
+        step = get_lot_size_step(client, symbol)
+        held_qty = round_to_step(amount, step)
+        if held_qty <= 0:
+            continue
+
+        # Only reconstruct if the held value is meaningful (avoids reconciling dust)
+        try:
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            current_price = float(ticker["price"])
+        except BinanceAPIException:
+            continue
+        if held_qty * current_price < 1.0:
+            continue  # not worth tracking, likely leftover dust
+
+        # Look up recent trades on this symbol to find the actual buy price/time
+        try:
+            trades = client.get_my_trades(symbol=symbol, limit=20)
+        except BinanceAPIException as e:
+            log.warning(f"Reconciliation: found untracked {symbol} balance but couldn't fetch trade history: {e}")
+            trades = []
+
+        buy_trades = [t for t in trades if t.get("isBuyer")]
+        if buy_trades:
+            last_buy = buy_trades[-1]
+            buy_price = float(last_buy["price"])
+            buy_time = datetime.utcfromtimestamp(last_buy["time"] / 1000).isoformat()
+        else:
+            # No trade history found (e.g. very old trade beyond the lookback) —
+            # fall back to current price so the bot can still manage it going forward,
+            # even though the true entry price/profit calc won't be accurate.
+            buy_price = current_price
+            buy_time = datetime.utcnow().isoformat()
+            log.warning(f"Reconciliation: {symbol} balance found but no buy trade in history — using current price as entry (P/L on this one won't be accurate).")
+
+        target_pct, stop_pct = SELL_TARGET_PCT, STOP_LOSS_PCT
+        if ATR_ENABLED:
+            _, target_pct, stop_pct = get_dynamic_thresholds(client, state, symbol)
+
+        state["positions"][symbol] = {
+            "buy_price": buy_price,
+            "qty": held_qty,
+            "timestamp": buy_time,
+            "peak_price": max(buy_price, current_price),
+            "trailing_active": False,
+            "target_pct": target_pct,
+            "stop_pct": stop_pct,
+            "partial_taken": False,
+        }
+        recovered += 1
+        log.info(
+            f"Reconciliation: recovered untracked position {symbol} — bought @ {buy_price} "
+            f"on {buy_time}, qty {held_qty}, currently @ {current_price}"
+        )
+
+    if recovered:
+        log.info(f"Reconciliation complete: recovered {recovered} position(s) the bot had lost track of.")
+    else:
+        log.info("Reconciliation complete: no untracked positions found — state.json matches actual account holdings.")
+
 def get_symbol_multiplier(state, symbol):
     """
     Returns this symbol's current adaptive multiplier (1.0 = normal).
@@ -619,7 +753,7 @@ def place_buy(client, state, symbol, price, reason, target_pct, stop_pct):
     if qty_usdt < min_notional:
         log.warning(f"{symbol}: position size ${qty_usdt} below exchange minimum ${min_notional}. Skipping buy.")
         return
-    quantity = round(qty_usdt / price, 6)
+    quantity = round_to_step(qty_usdt / price, get_lot_size_step(client, symbol))
     try:
         client.order_market_buy(symbol=symbol, quoteOrderQty=qty_usdt)
         state["positions"][symbol] = {
@@ -644,23 +778,30 @@ def place_sell(client, state, symbol, price, reason):
     pos = state["positions"].get(symbol)
     if not pos:
         return
+    step = get_lot_size_step(client, symbol)
+    sell_qty = round_to_step(pos["qty"], step)
+    if sell_qty <= 0:
+        log.error(f"{symbol}: sell quantity rounded to 0 with step {step} (position qty {pos['qty']}). Cannot sell — check position manually.")
+        return
     try:
-        client.order_market_sell(symbol=symbol, quantity=pos["qty"])
-        profit = (price - pos["buy_price"]) * pos["qty"]
+        client.order_market_sell(symbol=symbol, quantity=sell_qty)
+        profit = (price - pos["buy_price"]) * sell_qty
         log.info(f"SELL {symbol} @ {price} | profit: ${profit:.4f} | reason: {reason}")
         state["trade_log"].append({"action": "SELL", "symbol": symbol, "price": price, "profit": profit, "reason": reason, "time": datetime.utcnow().isoformat()})
         del state["positions"][symbol]
         update_symbol_confidence(state, symbol, was_win=(profit >= 0))
     except BinanceAPIException as e:
-        log.error(f"Sell failed for {symbol}: {e}")
+        log.error(f"Sell failed for {symbol} (qty {sell_qty}, step {step}): {e}")
 
 def place_partial_sell(client, state, symbol, price, fraction, reason):
     """Sells a fraction of the position (e.g. half) at target, leaving the rest to trail."""
     pos = state["positions"].get(symbol)
     if not pos:
         return
-    sell_qty = round(pos["qty"] * fraction, 6)
+    step = get_lot_size_step(client, symbol)
+    sell_qty = round_to_step(pos["qty"] * fraction, step)
     if sell_qty <= 0:
+        log.warning(f"{symbol}: partial sell quantity rounded to 0 with step {step} — skipping partial, will exit fully at next trigger instead.")
         return
     try:
         client.order_market_sell(symbol=symbol, quantity=sell_qty)
@@ -670,10 +811,10 @@ def place_partial_sell(client, state, symbol, price, fraction, reason):
             "action": "SELL", "symbol": symbol, "price": price, "profit": profit,
             "reason": f"partial ({fraction*100:.0f}%): {reason}", "time": datetime.utcnow().isoformat()
         })
-        pos["qty"] = round(pos["qty"] - sell_qty, 6)
+        pos["qty"] = round_to_step(pos["qty"] - sell_qty, step)
         pos["partial_taken"] = True
     except BinanceAPIException as e:
-        log.error(f"Partial sell failed for {symbol}: {e}")
+        log.error(f"Partial sell failed for {symbol} (qty {sell_qty}, step {step}): {e}")
 
 def manage_open_position(client, state, symbol, price):
     pos = state["positions"][symbol]
@@ -784,6 +925,11 @@ def summary(state):
 def main():
     client = get_client()
     state = load_state()
+
+    # Self-healing: check Binance's actual account holdings for any positions
+    # state.json lost track of (e.g. after a free-tier redeploy wiped it)
+    reconcile_positions_from_exchange(client, state)
+    save_state(state)
 
     # Backfill new position fields for any positions saved by an older bot version
     for sym, pos in state["positions"].items():
