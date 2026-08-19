@@ -610,10 +610,16 @@ def reconcile_positions_from_exchange(client, state):
     """
     Self-healing startup check: asks Binance what the account is actually holding
     (real balances) instead of only trusting state.json, which can be wiped on a
-    free-tier redeploy. For any coin held in the watchlist/scan universe that the
-    bot doesn't already have a tracked position for, this looks up the account's
-    recent trade history for that symbol to find the actual buy price and
-    timestamp, then reconstructs the position so the bot can manage it again.
+    free-tier redeploy. For any coin held that the bot doesn't already have a
+    tracked position for, this checks the account's real trade history for that
+    symbol — if a genuine buy trade exists, the position is reconstructed with
+    its real entry price and timestamp so the bot can manage it again.
+
+    Balances with NO real buy trade behind them are skipped, not reconstructed.
+    This matters because testnet accounts come pre-funded with dozens of free
+    "faucet" coins across many pairs that were never actually purchased — treating
+    those as bot-opened positions would flood state with fake trades and block
+    real trading via MAX_CONCURRENT_POSITIONS.
 
     This only ADDS positions the bot lost track of — it never removes or
     overwrites a position state.json already knows about.
@@ -662,25 +668,25 @@ def reconcile_positions_from_exchange(client, state):
         if held_qty * current_price < 1.0:
             continue  # not worth tracking, likely leftover dust
 
-        # Look up recent trades on this symbol to find the actual buy price/time
+        # Look up recent trades on this symbol to find the actual buy price/time.
+        # Only reconstruct a position if there's REAL buy trade history — testnet
+        # accounts come pre-funded with dozens of free "faucet" coins across many
+        # pairs that were never actually bought, and those have no trade history.
+        # Falling back to "use current price" would wrongly treat all of that
+        # starter money as bot-opened positions, so we skip instead.
         try:
             trades = client.get_my_trades(symbol=symbol, limit=20)
         except BinanceAPIException as e:
             log.warning(f"Reconciliation: found untracked {symbol} balance but couldn't fetch trade history: {e}")
-            trades = []
+            continue
 
         buy_trades = [t for t in trades if t.get("isBuyer")]
-        if buy_trades:
-            last_buy = buy_trades[-1]
-            buy_price = float(last_buy["price"])
-            buy_time = datetime.utcfromtimestamp(last_buy["time"] / 1000).isoformat()
-        else:
-            # No trade history found (e.g. very old trade beyond the lookback) —
-            # fall back to current price so the bot can still manage it going forward,
-            # even though the true entry price/profit calc won't be accurate.
-            buy_price = current_price
-            buy_time = datetime.utcnow().isoformat()
-            log.warning(f"Reconciliation: {symbol} balance found but no buy trade in history — using current price as entry (P/L on this one won't be accurate).")
+        if not buy_trades:
+            continue  # no real purchase behind this balance — likely testnet starter funds, skip silently
+
+        last_buy = buy_trades[-1]
+        buy_price = float(last_buy["price"])
+        buy_time = datetime.utcfromtimestamp(last_buy["time"] / 1000).isoformat()
 
         target_pct, stop_pct = SELL_TARGET_PCT, STOP_LOSS_PCT
         if ATR_ENABLED:
