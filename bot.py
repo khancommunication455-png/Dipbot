@@ -944,8 +944,15 @@ def main():
     client = get_client()
     state = load_state()
 
+    # Start dashboard server FIRST, before anything else — Render's health check
+    # needs to see the port bound quickly, and reconciliation below can take a
+    # while (looping through every account balance calling rate-limited API
+    # endpoints), so starting the server late risked Render timing out the deploy.
+    threading.Thread(target=start_dashboard_server, daemon=True).start()
+
     # Self-healing: check Binance's actual account holdings for any positions
     # state.json lost track of (e.g. after a free-tier redeploy wiped it)
+    log.info("Starting reconciliation check against real Binance account balances (this can take a minute)...")
     reconcile_positions_from_exchange(client, state)
     save_state(state)
 
@@ -976,9 +983,6 @@ def main():
     _shared_state["positions"] = state["positions"]
     _shared_state["trade_log"] = state["trade_log"]
     _shared_state["symbol_stats"] = state["symbol_stats"]
-
-    # Start dashboard server in background thread so Render sees this as a live web service
-    threading.Thread(target=start_dashboard_server, daemon=True).start()
 
     log.info(f"Watching: {WATCHLIST}")
     log.info(
